@@ -295,7 +295,7 @@ def ps2recomp_export(func_list, sce_matches, elf_name, output_dir):
 # FULL ANALYSIS (Phase 1 / Xbox 360 only)
 # ═══════════════════════════════════════════════════════════════
 
-def full_analysis(elf_path, output_dir, sce_db=None):
+def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
     """Phase 1: IDA analysis → DB + Knowledge Base + JSON exports."""
     import idaapi, ida_funcs, ida_hexrays, ida_bytes
     import idautils, ida_segment, ida_nalt, ida_entry
@@ -309,7 +309,58 @@ def full_analysis(elf_path, output_dir, sce_db=None):
     os.makedirs(export_dir, exist_ok=True)
 
     log(f"[Phase 1] Opening {elf_name}...")
-    idapro.open_database(elf_path, run_auto_analysis=True)
+
+    # Xbox 360 PE from XEX has corrupted VA fields.
+    # IDA's PE loader loads it with x86 processor, but we need PPC.
+    # Workaround: load as PE to get segments, then recreate at 0x82000000.
+    # NOTE: Auto-analysis will use x86 processor. For full PPC analysis,
+    # use the PE directly in interactive IDA with PPC processor selected.
+    if platform == "xbox360":
+        import struct
+        log("  Xbox 360 mode: Loading PE + creating segments at 0x82000000")
+        idapro.open_database(elf_path, run_auto_analysis=False)
+
+        # Parse PE sections
+        with open(elf_path, 'rb') as f:
+            f.seek(0x3C)
+            pe_offset = struct.unpack('<I', f.read(4))[0]
+            f.seek(pe_offset + 6)
+            num_sections = struct.unpack('<H', f.read(2))[0]
+            f.seek(pe_offset + 24)
+            sections = []
+            for i in range(num_sections):
+                name_raw = f.read(8)
+                name = name_raw.rstrip(b'\x00').decode('ascii', errors='replace').strip()
+                vsize = struct.unpack('<I', f.read(4))[0]
+                vaddr = struct.unpack('<I', f.read(4))[0]
+                raw_size = struct.unpack('<I', f.read(4))[0]
+                raw_ptr = struct.unpack('<I', f.read(4))[0]
+                sections.append((name, vaddr, vsize, raw_ptr, raw_size))
+                f.seek(pe_offset + 24 + (i+1) * 40)
+
+        # Delete existing segments
+        for seg_ea in list(idautils.Segments()):
+            seg = ida_segment.getseg(seg_ea)
+            ida_segment.del_segm(seg.start_ea, 1)
+
+        # Create segments at 0x82000000 base
+        base = 0x82000000
+        file_offset = 0x400
+        for name, vaddr, vsize, raw_ptr, raw_size in sections:
+            if raw_size == 0:
+                continue
+            seg_start = base + file_offset
+            seg_end = seg_start + raw_size
+            seg_class = 'CODE' if name in ['.text', '.pdata'] else 'DATA'
+            ida_segment.add_segm(0, seg_start, seg_end, name, seg_class)
+            log(f"    {name}: 0x{seg_start:08X}-0x{seg_end:08X}")
+            file_offset += raw_size
+
+        # Run auto-analysis (will use x86 processor, but segments are correct)
+        log("  Running auto-analysis (x86 processor - use interactive IDA for full PPC)...")
+        idaapi.auto_wait()
+    else:
+        idapro.open_database(elf_path, run_auto_analysis=True)
 
     # Load SCE database (auto-load if PS2 and not provided)
     sce_db_data = {}
@@ -486,7 +537,7 @@ if __name__ == "__main__":
         log("XBOX 360 DETECTED — Running Phase 1 + Phase 2")
         log("=" * 60)
 
-        result = full_analysis(binary_path, output_dir)
+        result = full_analysis(binary_path, output_dir, platform="xbox360")
 
         log("")
         log("=" * 60)
