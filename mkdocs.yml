@@ -1,0 +1,6 @@
+site_name: Recomp Reverse Toolkit
+site_description: Herramientas de análisis y recompilación de binarios PS2/Xbox 360
+nav:
+  - Inicio: index.md
+  - Guía: guide.md
+  - Skill Reference: skill.md
