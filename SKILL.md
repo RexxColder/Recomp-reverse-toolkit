@@ -2773,206 +2773,119 @@ while new_functions:
 
 ---
 
-## 24. PS2RECOMP WORKFLOW — IDA Pro (Unified Script)
+## 24. UNIFIED ANALYSIS TOOL (PS2 + Xbox 360)
 
-Generate CSV function map + TOML config for PS2Recomp from PS2 ELF files. The unified script `ps2_recomp_export.py` combines SCE SHA-1 matching, code-based detection, and batch processing.
+Entry point: `analyze.py` — detects platform and runs appropriate analysis.
 
-### Script Location
+### Flow
 
-`ps2xAnalyzer/tools/ps2_recomp_export.py` in the PS2Recomp repository.
-
-### Features
-
-- **SCE SHA-1 matching** — 52 SDK libraries, 5,323 function names, 9,132 hash variants
-- **Code-based detection** — syscalls (positive+negative), MMIO, thunks
-- **Batch mode** — process all PS2 ISOs in a directory
-- **Single file mode** — analyze one ELF at a time
-
-### Requirements
-
-1. **SCE symbol database** (`sce_symbols.json`) — extracted from PS2Recomp's embedded C++ data
-2. **IDALib** Python module — for headless IDA analysis
-3. **IDA Pro 9.0+** — with MIPS processor support
-
-### Setup: Extract SCE Database
-
-```bash
-python3 -c "
-import re, json
-with open('ps2xAnalyzer/include/ps2recomp/sce_symbol_database_data.h') as f:
-    content = f.read()
-chunks = re.findall(r'R\"PS2SDB\((.*?)\)PS2SDB\"', content, re.DOTALL)
-json_str = ''.join(chunks)
-tree_marker = json_str.find('{\"skip\"')
-data = json.loads(json_str[:tree_marker])
-with open('/tmp/sce_symbols.json', 'w') as f:
-    json.dump(data, f)
-print(f'Extracted {sum(len(f) for f in data.values())} function names')
-"
+```
+analyze.py game.xex|game.elf /output/
+├── Detect platform: PS2 (ELF/MIPS) or Xbox 360 (XEX/PPC)
+├── Xbox 360 → IDA analysis → DB + Knowledge Base + JSON
+└── PS2 → Phase 1: IDA analysis → DB + Knowledge Base + JSON
+          → Phase 2: PS2Recomp export → CSV + TOML
 ```
 
 ### Usage
 
-**Single ELF:**
 ```bash
-PYTHONPATH="/path/to/IDA/idalib/python:$PYTHONPATH" \
+PYTHONPATH="/path/to/IDA:/path/to/IDA/python" \
+  python3 analyze.py game.elf /output/dir
+```
+
+### Output (PS2)
+
+```
+<game>_PS2/
+├── <game>.db              (SQLite: functions, decompiled, strings, xrefs)
+├── <GAME>_KNOWLEDGE_BASE.md
+├── config.toml            (PS2Recomp config)
+├── functions.csv          (Name,Start,End,Size)
+└── export/ (JSONs)
+```
+
+### Output (Xbox 360)
+
+```
+<game>_Xbox360/
+├── <game>.db              (SQLite)
+├── <GAME>_KNOWLEDGE_BASE.md
+└── export/ (JSONs)
+```
+
+---
+
+## 25. PS2RECOMP EXPORT (PS2 only)
+
+Script: `ps2_recomp_export.py` — generates CSV + TOML for ps2xRecomp.
+
+### Features
+
+- SCE SHA-1 signature matching (52 SDK libraries, 5,323 function names)
+- Code-based detection (syscalls, MMIO, thunks)
+- Batch mode: `python3 ps2_recomp_export.py --batch /path/to/isos/ /output/`
+- Auto-extraction of SCE database from PS2Recomp source
+
+### Usage
+
+```bash
+PYTHONPATH="/path/to/IDA:/path/to/IDA/python" \
   python3 ps2_recomp_export.py game.elf /output/dir
 ```
 
-**Batch (all ISOs in directory):**
+### Libraries Detected
+
+libkernl (926), libhttps (107), libhig (45), libc (40), libmpeg (33), libnet (33), libgraph (28), libgcc (27), libdma (5), libvu0 (3), libpad (2), libmc (2)
+
+---
+
+## 26. FULL IDA ANALYSIS (PS2 + Xbox 360)
+
+Script: `ps2_full_analysis.py` — generates SQLite DB + Knowledge Base + JSON exports.
+
+### Features
+
+- Hex-Rays decompilation of all functions
+- SCE SHA-1 signature matching (PS2)
+- String extraction and categorization
+- Cross-reference extraction
+- SQLite database with functions, decompiled code, strings, xrefs
+- Knowledge Base markdown with executive summary
+- JSON exports by category
+
+### Usage
+
 ```bash
-PYTHONPATH="/path/to/IDA/idalib/python:$PYTHONPATH" \
-  python3 ps2_recomp_export.py --batch /path/to/isos/ /output/dir
+PYTHONPATH="/path/to/IDA:/path/to/IDA/python" \
+  python3 ps2_full_analysis.py game.elf /output/dir
 ```
 
 ### Output
 
-Each game gets:
-- `functions.csv` — CSV with `Name,Start,End,Size` (SDK names included)
-- `config.toml` — TOML config for ps2xRecomp
-
-### Results (tested on 5 games)
-
-| Game | Functions | SDK Matches | Libraries |
-|------|-----------|-------------|-----------|
-| Sonic Riders ZG | 17,745 | 1,295 | 15+ |
-| Tony Hawk Downhill Jam | 11,626 | 1,471 | 15+ |
-| DBZ Budokai Tenkaichi 3 | 8,126 | 604 | 15+ |
-| Biohazard Outbreak | 4,775 | 575 | 15 |
-| Biohazard Outbreak File 2 | 4,835 | 589 | 15 |
-
-### Libraries Detected
-
-libkernl, libhttps, libhig, libc, libmpeg, libnet, libgraph, libgcc, libdma, libvu0, libpad, libmc, libmc2, libscf, eenetctl, gcc_wrapper, mslgcc_ps2, and more.
-with open('ps2xAnalyzer/include/ps2recomp/sce_symbol_database_data.h') as f:
-    content = f.read()
-chunks = re.findall(r'R\"PS2SDB\((.*?)\)PS2SDB\"', content, re.DOTALL)
-json_str = ''.join(chunks)
-tree_marker = json_str.find('{\"skip\"')
-symbols_json = json_str[:tree_marker] if tree_marker > 0 else json_str
-data = json.loads(symbols_json)
-with open('/tmp/sce_symbols.json', 'w') as f:
-    json.dump(data, f)
-print(f'Extracted {sum(len(f) for f in data.values())} function names from {len(data)} libraries')
-"
+```
+<game>/
+├── <game>.db              (SQLite)
+├── <GAME>_KNOWLEDGE_BASE.md
+└── export/
+    ├── decompiled_Unknown.json
+    ├── segments.json
+    ├── strings_*.json
+    └── Unknown.json
 ```
 
-### Script: `ps2_full_export.py`
+---
 
-The full export script combines:
-- **SCE SHA-1 matching** — identifies real SDK function names
-- **Code-based detection** — syscalls, MMIO, thunks
-- **Negative syscalls** — IOP mode functions
-- **String-based detection** — SDK references in strings
+## 27. IDA vs GHIDRA for PS2Recomp
 
-**Usage:**
-```bash
-# From idalib
-PYTHONPATH="/path/to/IDA/idalib/python:$PYTHONPATH" python3 ps2_full_export.py
-
-# Or with idat headless (requires -OIDAPython flag)
-idat -A -OIDAPython:ps2_full_export.py game.elf
-```
-
-**Output:**
-- `<game>_functions.csv` — CSV with `Name,Start,End,Size` (SDK names included)
-- `<game>.tomL` — TOML config with stubs, untracked_stubs, performance critical
-
-### Generated TOML Format
-
-```toml
-# PS2Recomp configuration (IDA Pro + SCE SHA-1 matching)
-# Input: SLUS_216.42
-
-[general]
-input = "SLUS_216.42"
-ghidra_output = ""
-output = "./output/"
-single_file_output = false
-patch_syscalls = false
-patch_cop0 = true
-patch_cache = true
-
-stubs = [
-  "libgraph::sceGsSyncV@0x00102F68",
-  "libdma::sceDmaSend@0x00103E08",
-  "libc::_Balloc@0x00129D00",
-  "libkernl::_sceFsSemInit@0x00101E20",
-  # ... (1,295 SCE matches + 1,955 thunks)
-]
-
-untracked_stubs = [
-  "io_access@0x00103A78",
-  # ... (71 IO functions)
-]
-
-skip = []
-```
-
-### Libraries Detected
-
-| Library | Functions | Description |
-|---------|-----------|-------------|
-| libkernl | 926 | PS2 kernel functions |
-| libhttps | 107 | HTTPS/networking |
-| libhig | 45 | Graphics |
-| libc | 40 | C standard library |
-| libmpeg | 33 | MPEG decode |
-| libnet | 33 | Networking |
-| libgraph | 28 | GS graphics |
-| libgcc | 27 | GCC runtime |
-| libdma | 5 | DMA transfers |
-| libvu0 | 3 | VU0 math |
-| libpad | 2 | Gamepad input |
-| libmc | 2 | Memory card |
-
-### Limitations
-
-- SHA-1 matching requires the function body to match a known SDK variant
-- Some functions may be compiler-optimized variants not in the database
-- The database covers PS2 SDK versions 1.5.3 to 2.8.1
-- Very small functions (<8 bytes) are skipped
-    "RotateThreadReadyQueue", "iRotateThreadReadyQueue", "ReleaseWaitThread",
-    "iReleaseWaitThread", "CreateSema", "DeleteSema", "SignalSema",
-    "iSignalSema", "WaitSema", "PollSema", "iPollSema", "ReferSemaStatus",
-    "iReferSemaStatus", "CreateEventFlag", "DeleteEventFlag", "SetEventFlag",
-    "iSetEventFlag", "ClearEventFlag", "iClearEventFlag", "WaitEventFlag",
-    "PollEventFlag", "iPollEventFlag", "ReferEventFlagStatus",
-    "iReferEventFlagStatus", "InitAlarm", "SetAlarm", "iSetAlarm",
-    "CancelAlarm", "iCancelAlarm", "ReleaseAlarm", "iReleaseAlarm",
-    "AddIntcHandler", "AddIntcHandler2", "RemoveIntcHandler",
-    "AddDmacHandler", "AddDmacHandler2", "RemoveDmacHandler",
-    "EnableIntc", "iEnableIntc", "DisableIntc", "iDisableIntc",
-    "EnableDmac", "iEnableDmac", "DisableDmac", "iDisableDmac",
-    # SIF
-    "SifStopModule", "SifLoadModule", "SifInitRpc", "SifBindRpc",
-    "SifCallRpc", "SifRegisterRpc", "SifCheckStatRpc", "SifSetRpcQueue",
-    "SifRemoveRpcQueue", "SifRemoveRpc", "sceSifCallRpc", "sceSifSendCmd",
-    "sceRpcGetPacket",
-    # File I/O
-    "fioOpen", "fioClose", "fioRead", "fioWrite", "fioLseek", "fioMkdir",
-    "fioChdir", "fioRmdir", "fioGetstat", "fioRemove",
-    # GS
-    "SetGsCrt", "GsSetCrt", "GsGetIMR", "iGsGetIMR", "GsPutIMR", "iGsPutIMR",
-    "SetVSyncFlag", "SetSyscall", "GsSetVideoMode", "GetOsdConfigParam",
-    "SetOsdConfigParam", "EnableCache", "DisableCache", "GetRomName",
-    "SifLoadElfPart", "sceSifLoadElf", "sceSifLoadElfPart",
-    "sceSifLoadModule", "sceSifLoadModuleBuffer", "SetupThread",
-    "EndOfHeap", "GetMemorySize", "Deci2Call", "QueryBootMode",
-    "GetThreadTLS", "Copy", "GetEntryAddress", "RegisterExitHandler",
-    # Generic return handlers
-    "ret0", "ret1", "reta0",
-    # Memory
-    "calloc_r", "free_r", "realloc_r", "memalign_r", "malloc_r",
-    "malloc_extend_top", "malloc_trim_r", "mbtowc_r", "printf_r",
-    "__malloc_lock", "__malloc_unlock",
-    # Stdlib
-    "abs", "__ieee754_rem_pio2f", "__kernel_cosf", "__kernel_sinf",
-    "atan", "atan2", "calloc", "ceil", "close", "cos", "exit", "exp",
-    "fabs", "fclose", "fflush", "floor", "fopen", "fprintf", "fread",
-    "free", "fseek", "fstat", "ftell", "fwrite", "getpid", "log", "log10",
-    "lseek", "malloc", "memalign", "memclr", "memchr", "memcmp", "memcpy",
-    "memmove", "memset", "open", "pow", "printf", "puts", "rand", "read",
+| Aspect | IDA Pro | Ghidra |
+|--------|---------|--------|
+| Decompiler MIPS | hexmips (mejor en algunos casos) | Integrado |
+| Headless | idat -A -OIDAPython | analyzeHeadless |
+| License | Comercial | Gratis |
+| Speed | Más rápido | Más lento |
+| Scripts | Python | Java/Python |
+| Recommended for | Análisis rápido, decompiling | Games strippados (workflow oficial) |
     "realloc", "sin", "snprintf", "sprintf", "sqrt", "srand", "stat",
     "strcasecmp", "strcat", "strchr", "strcmp", "strcpy", "strlen", "strncat",
     "strncmp", "strncpy", "strrchr", "strstr", "tan", "vfprintf", "vsprintf",
