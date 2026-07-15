@@ -46,10 +46,19 @@ def detect_platform(file_path):
                 return "ps2"
     elif magic == b'XEX2':
         return "xbox360"
+    elif magic[:2] == b'MZ':  # PE file (extracted from XEX)
+        return "xbox360"
     elif file_path.endswith('.xex') or file_path.endswith('.XEX'):
         return "xbox360"
     elif file_path.endswith('.elf') or file_path.endswith('.ELF'):
         return "ps2"
+    elif file_path.endswith('.bin') or file_path.endswith('.exe'):
+        # Could be extracted PE - check for PPC code patterns
+        with open(file_path, 'rb') as f:
+            header = f.read(256)
+        if b'MIPS' in header:
+            return "ps2"
+        return "xbox360"  # Default to Xbox 360 for .bin/.exe
 
     # Try to detect from file content
     with open(file_path, 'rb') as f:
@@ -472,15 +481,54 @@ if __name__ == "__main__":
         log(f"  TOML: {ps2_result['toml']}")
 
     elif platform == "xbox360":
-        # Xbox 360: IDA analysis only
+        # Xbox 360: Phase 1 (IDA analysis) + Phase 2 (ReXGlue export)
         log("=" * 60)
-        log("XBOX 360 DETECTED — Running IDA Analysis")
+        log("XBOX 360 DETECTED — Running Phase 1 + Phase 2")
         log("=" * 60)
+
         result = full_analysis(binary_path, output_dir)
+
         log("")
-        log("COMPLETE")
-        log(f"  DB: {output_dir}/{os.path.splitext(result['elf_name'])[0]}.db")
+        log("=" * 60)
+        log("Phase 2: ReXGlue Export")
+        log("=" * 60)
+
+        # Run xbox360_recomp_export.py using the DB from Phase 1
+        db_path = os.path.join(output_dir, f"{os.path.splitext(result['elf_name'])[0]}.db")
+        toml_path = os.path.join(output_dir, "config.toml")
+        elf_name = result["elf_name"]
+
+        try:
+            import subprocess
+            export_script = str(SCRIPT_DIR / "xbox360_recomp_export.py")
+            cmd = [
+                sys.executable, export_script,
+                "--db", db_path,
+                "--file-path", elf_name,
+                "--project-name", os.path.splitext(elf_name)[0],
+                "--out-directory", "generated",
+                "--output", toml_path,
+                "--all-functions",
+            ]
+            log(f"Running: {' '.join(cmd)}")
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0:
+                log(proc.stdout)
+                log(f"TOML: {toml_path}")
+            else:
+                log(f"Export warning: {proc.stderr}")
+                log(f"TOML: {toml_path} (partial)")
+        except Exception as e:
+            log(f"Export error: {e}")
+            log(f"DB available at: {db_path}")
+
+        log("")
+        log("=" * 60)
+        log("ALL PHASES COMPLETE")
+        log("=" * 60)
+        log(f"  DB: {db_path}")
         log(f"  KB: {output_dir}/{os.path.splitext(result['elf_name'])[0].upper()}_KNOWLEDGE_BASE.md")
+        log(f"  TOML: {toml_path}")
 
     else:
         log(f"ERROR: Unknown platform for {binary_path}")
