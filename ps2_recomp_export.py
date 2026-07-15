@@ -37,6 +37,10 @@ from pathlib import Path
 # SCE SYMBOL DATABASE
 # ═══════════════════════════════════════════════════════════════
 
+SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__))) if '__file__' in dir() else Path.cwd()
+DEFAULT_SCE_DB = SCRIPT_DIR / "sce_symbols.json"
+PS2RECOMP_HEADER = "/mnt/Datos/Proyectos/PS2Recomp/ps2xAnalyzer/include/ps2recomp/sce_symbol_database_data.h"
+
 RELOC_MASKS = {
     "MIPS_NONE": 0xFFFFFFFF, "MIPS_26": 0xFC000000,
     "MIPS_HI16": 0xFFFF0000, "MIPS_LO16": 0xFFFF0000,
@@ -44,10 +48,35 @@ RELOC_MASKS = {
     "MIPS_32": 0x00000000,
 }
 
-def load_sce_database(symbols_path):
-    """Load SCE symbol database from JSON."""
-    with open(symbols_path, 'r') as f:
-        data = json.load(f)
+def extract_sce_database():
+    """Auto-extract SCE database from PS2Recomp C++ header."""
+    if not os.path.exists(PS2RECOMP_HEADER):
+        print(f"WARNING: PS2Recomp header not found at {PS2RECOMP_HEADER}")
+        print("SCE matching will be disabled.")
+        return {}
+    with open(PS2RECOMP_HEADER, 'r') as f:
+        content = f.read()
+    chunks = re.findall(r'R"PS2SDB\((.*?)\)PS2SDB"', content, re.DOTALL)
+    json_str = ''.join(chunks)
+    tree_marker = json_str.find('{"skip"')
+    data = json.loads(json_str[:tree_marker] if tree_marker > 0 else json_str)
+    # Cache for next run
+    with open(DEFAULT_SCE_DB, 'w') as f:
+        json.dump(data, f)
+    return data
+
+def load_sce_database(symbols_path=None):
+    """Load SCE symbol database from JSON file."""
+    if symbols_path is None:
+        symbols_path = str(DEFAULT_SCE_DB)
+    if not os.path.exists(symbols_path):
+        print(f"SCE database not found at {symbols_path}, extracting...")
+        data = extract_sce_database()
+        if not data:
+            return {}
+    else:
+        with open(symbols_path, 'r') as f:
+            data = json.load(f)
     hash_lookup = {}
     for library, functions in data.items():
         for name, hashes in functions.items():
@@ -436,13 +465,13 @@ if __name__ == "__main__":
         idx = sys.argv.index("--batch")
         iso_dir = sys.argv[idx + 1]
         output_dir = sys.argv[idx + 2]
-        sce_db = sys.argv[idx + 3] if len(sys.argv) > idx + 3 else "/tmp/sce_symbols.json"
+        sce_db = sys.argv[idx + 3] if len(sys.argv) > idx + 3 else None
         run_batch(iso_dir, output_dir, sce_db)
     elif len(sys.argv) >= 3:
         # Single file mode (requires idalib context)
         elf_path = sys.argv[1]
         output_dir = sys.argv[2]
-        sce_db = sys.argv[3] if len(sys.argv) > 3 else "/tmp/sce_symbols.json"
+        sce_db = sys.argv[3] if len(sys.argv) > 3 else None
         db = load_sce_database(sce_db)
         stats = export_elf(elf_path, output_dir, db)
         print(f"Done: {stats}")
