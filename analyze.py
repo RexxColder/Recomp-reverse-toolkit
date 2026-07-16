@@ -23,10 +23,13 @@ import sqlite3
 import hashlib
 import struct
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 from collections import Counter, defaultdict
 
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__))) if '__file__' in dir() else Path.cwd()
+XEXTOOL = "/mnt/Datos/Herramientas/XexTool_v6/xextool.exe"
 
 # ═══════════════════════════════════════════════════════════════
 # PLATFORM DETECTION
@@ -69,6 +72,242 @@ def detect_platform(file_path):
         return "xbox360"
 
     return "unknown"
+
+# ═══════════════════════════════════════════════════════════════
+# XEX → PE EXTRACTION (Xbox 360)
+# ═══════════════════════════════════════════════════════════════
+
+def extract_pe_from_xex(xex_path, output_dir):
+    """Extract base PE from XEX using xextool. Returns PE path or None."""
+    pe_path = os.path.join(output_dir, "basefile.exe")
+    if not os.path.exists(XEXTOOL):
+        log(f"  WARNING: xextool not found at {XEXTOOL}, trying to load XEX directly")
+        return None
+    cmd = ['wine', XEXTOOL, '-b', pe_path, xex_path]
+    log(f"  Extracting PE from XEX via xextool...")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if os.path.exists(pe_path) and os.path.getsize(pe_path) > 0:
+            log(f"  PE extracted: {os.path.getsize(pe_path)} bytes")
+            return pe_path
+        else:
+            log(f"  WARNING: xextool extraction failed, trying to load XEX directly")
+            return None
+    except Exception as e:
+        log(f"  WARNING: xextool error: {e}, trying to load XEX directly")
+        return None
+
+# ═══════════════════════════════════════════════════════════════
+# SDK IMPORTS (Xbox 360)
+# ═══════════════════════════════════════════════════════════════
+
+def extract_imports(pe_path=None):
+    """Extract PE import table entries. Tries IDA API first, falls back to manual PE parsing."""
+    import ida_nalt
+
+    # Try IDA API first
+    imports = []
+    num_modules = ida_nalt.get_import_module_qty()
+    if num_modules > 0:
+        for i in range(num_modules):
+            mod_name = ida_nalt.get_import_module_name(i)
+            if not mod_name:
+                mod_name = f"module_{i}"
+            def callback(ea, ord_val, name, param):
+                func_name = name if name else f"ord_{ord_val}" if ord_val else f"unknown_{ea:08X}"
+                imports.append({"address": ea, "module": mod_name, "name": func_name, "ordinal": ord_val or 0})
+                return True
+            ida_nalt.enum_import_names(i, callback)
+        return imports
+
+    # Fallback: manual PE parsing with SDK ordinal matching (Xbox 360)
+    if pe_path and os.path.exists(pe_path):
+        imports = _parse_xbox360_imports(pe_path)
+    return imports
+
+
+def _parse_xbox360_imports(pe_path):
+    """Parse Xbox 360 PE imports using big-endian IAT ordinals + x360_imports.idc database."""
+    # Load SDK ordinal database from x360_imports.idc
+    sdk_db = _load_xbox360_sdk_db()
+
+    imports = []
+    with open(pe_path, 'rb') as f:
+        # Read PE header to find IAT location
+        f.seek(0x3C)
+        pe_offset = struct.unpack('<I', f.read(4))[0]
+        f.seek(pe_offset + 4)
+        num_sections = struct.unpack('<H', f.read(2))[0]
+        opt_start = pe_offset + 24
+        f.seek(opt_start)
+        opt_magic = struct.unpack('<H', f.read(2))[0]
+        is_pe32plus = (opt_magic == 0x20B)
+        opt_size = 240 if is_pe32plus else 224
+
+        f.seek(opt_start + 16)
+        image_base = struct.unpack('<Q' if is_pe32plus else '<I', f.read(8 if is_pe32plus else 4))[0]
+
+        # Read section headers
+        f.seek(opt_start + opt_size)
+        sections = []
+        for _ in range(num_sections):
+            raw = f.read(40)
+            name = raw[0:8].rstrip(b'\x00').decode('ascii', errors='replace')
+            vsize = struct.unpack('<I', raw[8:12])[0]
+            vaddr = struct.unpack('<I', raw[12:16])[0]
+            raw_size = struct.unpack('<I', raw[16:20])[0]
+            raw_ptr = struct.unpack('<I', raw[20:24])[0]
+            sections.append((name, vaddr, vsize, raw_ptr, raw_size))
+
+        # Get IAT from data directory (index 12)
+        dd_offset = opt_start + (112 if is_pe32plus else 96)
+        f.seek(dd_offset + 12 * 8)  # skip to IAT entry (12th * 8 bytes each)
+        iat_rva = struct.unpack('<I', f.read(4))[0]
+        iat_size = struct.unpack('<I', f.read(4))[0]
+
+        if iat_rva == 0 or iat_size == 0:
+            return imports
+
+        # Convert RVA to file offset
+        def rva_to_offset(rva):
+            for s_name, vaddr, vsize, raw_ptr, raw_size in sections:
+                if vaddr <= rva < vaddr + vsize:
+                    return raw_ptr + (rva - vaddr)
+            return None
+
+        iat_offset = rva_to_offset(iat_rva)
+        if iat_offset is None:
+            return imports
+
+        # Read IAT entries (big-endian for Xbox 360 PPC)
+        f.seek(iat_offset)
+        iat_data = f.read(iat_size)
+        iat_pos = 0
+
+        for i in range(0, len(iat_data), 4):
+            if i + 4 > len(iat_data):
+                break
+            ordinal = struct.unpack('>I', iat_data[i:i+4])[0]
+            if ordinal == 0:
+                break
+
+            iat_addr = image_base + iat_rva + i
+            if ordinal in sdk_db:
+                lib, name = sdk_db[ordinal]
+                imports.append({
+                    "address": iat_addr,
+                    "module": lib,
+                    "name": name,
+                    "ordinal": ordinal
+                })
+            else:
+                imports.append({
+                    "address": iat_addr,
+                    "module": "unknown",
+                    "name": f"ord_{ordinal}",
+                    "ordinal": ordinal
+                })
+
+    return imports
+
+
+def _load_xbox360_sdk_db():
+    """Load Xbox 360 SDK function database from x360_imports.idc."""
+    import re
+    idc_path = "/mnt/Datos/Herramientas/XexTool_v6/x360_imports.idc"
+    sdk_db = {}
+    if not os.path.exists(idc_path):
+        return sdk_db
+
+    current_lib = None
+    with open(idc_path) as f:
+        for line in f:
+            m = re.match(r'static\s+(\w+)NameGen', line)
+            if m:
+                current_lib = m.group(1)
+            m = re.match(r'.*id == 0x([0-9A-Fa-f]+)\)\s*funcName = "([^"]+)"', line)
+            if m and current_lib:
+                ordinal = int(m.group(1), 16)
+                name = m.group(2)
+                # Normalize library names
+                lib_map = {"xam": "xam.xex", "xboxkrnl": "xboxkrnl.exe",
+                           "xapi": "xapi.exe", "xbdm": "xbdm.xex",
+                           "connectx": "connectx.dll", "syscall": "syscall.exe",
+                           "createprofile": "createprofile.dll", "vk": "vk.dll"}
+                lib = lib_map.get(current_lib, current_lib)
+                sdk_db[ordinal] = (lib, name)
+    return sdk_db
+
+# ═══════════════════════════════════════════════════════════════
+# SWITCH TABLES (PPC jump tables for ReXGlue)
+# ═══════════════════════════════════════════════════════════════
+
+def detect_switch_tables(text_start, text_end):
+    """Detect PPC switch/jump tables in .rdata/.data sections.
+
+    Scans .text for bctr instructions, then looks backward to find
+    the mtctr that loads a table pointer from .rdata/.data.
+    Each table is an array of code pointers used for indirect branch.
+    """
+    import ida_bytes, ida_segment, idautils
+
+    tables = []
+    seen = set()
+
+    # Find .rdata segment only (vtables/switch tables live here, not in .data)
+    # Limit scan to first 2MB for performance
+    data_segs = []
+    for seg_ea in idautils.Segments():
+        seg = ida_segment.getseg(seg_ea)
+        name = ida_segment.get_segm_name(seg)
+        if name == '.rdata':
+            end = min(seg.end_ea, seg.start_ea + 2 * 1024 * 1024)  # cap at 2MB
+            data_segs.append((seg.start_ea, end))
+            break
+
+    # Scan .rdata for contiguous arrays of code pointers (switch tables / vtables)
+    for ds_start, ds_end in data_segs:
+        ds_ea = ds_start
+        while ds_ea < ds_end - 4:
+            if not ida_bytes.is_mapped(ds_ea):
+                ds_ea = ida_bytes.next_head(ds_ea, ds_end)
+                continue
+            ptr = ida_bytes.get_dword(ds_ea)
+            if text_start <= ptr < text_end:
+                # Candidate start - count contiguous code pointers
+                entries = []
+                scan_ptr = ds_ea
+                while scan_ptr < ds_end:
+                    if not ida_bytes.is_mapped(scan_ptr):
+                        break
+                    val = ida_bytes.get_dword(scan_ptr)
+                    if text_start <= val < text_end:
+                        entries.append(val)
+                        scan_ptr += 4
+                    else:
+                        break
+                if len(entries) >= 3 and ds_ea not in seen:
+                    tables.append({
+                        "address": ds_ea,
+                        "register": 9,  # CTR is default
+                        "num_labels": len(entries),
+                        "labels": entries
+                    })
+                    seen.add(ds_ea)
+                    ds_ea = scan_ptr  # skip past this table
+                else:
+                    ds_ea += 4
+            else:
+                ds_ea += 4
+
+    # Deduplicate and limit
+    unique = []
+    seen_addrs = set()
+    for t in tables:
+        if t["address"] not in seen_addrs:
+            seen_addrs.add(t["address"])
+            unique.append(t)
+    return unique[:2000]  # cap at 2000 tables
 
 # ═══════════════════════════════════════════════════════════════
 # STRING CATEGORIZATION
@@ -310,55 +549,94 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
 
     log(f"[Phase 1] Opening {elf_name}...")
 
-    # Xbox 360 PE from XEX has corrupted VA fields.
-    # IDA's PE loader loads it with x86 processor, but we need PPC.
-    # Workaround: load as PE to get segments, then recreate at 0x82000000.
-    # NOTE: Auto-analysis will use x86 processor. For full PPC analysis,
-    # use the PE directly in interactive IDA with PPC processor selected.
+    text_start = None
+    text_end = None
+    imports = []
+    switch_tables = []
+
     if platform == "xbox360":
         import struct
-        log("  Xbox 360 mode: Loading PE + creating segments at 0x82000000")
-        idapro.open_database(elf_path, run_auto_analysis=False)
 
-        # Parse PE sections
+        # ═══════════════════════════════════════════════════════════
+        # Xbox 360: Extract PE from XEX → load in IDA → PPC → scan
+        # XEX2 files must be extracted to PE first via xextool.
+        # The PE is loaded into IDA, processor changed to PPC, and
+        # function prologues scanned to create function entries.
+        # ═══════════════════════════════════════════════════════════
+
+        log("  Xbox 360 mode: XEX→PE extraction + PPC prologue scanning")
+
+        # Check if input is XEX (needs extraction) or already PE
         with open(elf_path, 'rb') as f:
-            f.seek(0x3C)
-            pe_offset = struct.unpack('<I', f.read(4))[0]
-            f.seek(pe_offset + 6)
-            num_sections = struct.unpack('<H', f.read(2))[0]
-            f.seek(pe_offset + 24)
-            sections = []
-            for i in range(num_sections):
-                name_raw = f.read(8)
-                name = name_raw.rstrip(b'\x00').decode('ascii', errors='replace').strip()
-                vsize = struct.unpack('<I', f.read(4))[0]
-                vaddr = struct.unpack('<I', f.read(4))[0]
-                raw_size = struct.unpack('<I', f.read(4))[0]
-                raw_ptr = struct.unpack('<I', f.read(4))[0]
-                sections.append((name, vaddr, vsize, raw_ptr, raw_size))
-                f.seek(pe_offset + 24 + (i+1) * 40)
+            magic = f.read(4)
 
-        # Delete existing segments
-        for seg_ea in list(idautils.Segments()):
+        if magic == b'XEX2':
+            # XEX: extract PE first
+            pe_path = extract_pe_from_xex(elf_path, output_dir)
+            if pe_path:
+                load_path = pe_path
+            else:
+                # Fallback: try loading XEX directly
+                load_path = elf_path
+        else:
+            # Already PE (extracted binary)
+            load_path = elf_path
+
+        # Load PE (creates segments at correct addresses)
+        log(f"  Loading: {load_path}")
+        idapro.open_database(load_path, run_auto_analysis=False)
+
+        # Change processor to PPC
+        log("  Setting processor to PPC...")
+        idaapi.set_processor_type('ppc', 0)
+
+        # Find .text section
+        text_start = None
+        text_end = None
+        for seg_ea in idautils.Segments():
             seg = ida_segment.getseg(seg_ea)
-            ida_segment.del_segm(seg.start_ea, 1)
+            name = ida_segment.get_segm_name(seg)
+            if name == '.text':
+                text_start = seg.start_ea
+                text_end = seg.end_ea
+                break
 
-        # Create segments at 0x82000000 base
-        base = 0x82000000
-        file_offset = 0x400
-        for name, vaddr, vsize, raw_ptr, raw_size in sections:
-            if raw_size == 0:
-                continue
-            seg_start = base + file_offset
-            seg_end = seg_start + raw_size
-            seg_class = 'CODE' if name in ['.text', '.pdata'] else 'DATA'
-            ida_segment.add_segm(0, seg_start, seg_end, name, seg_class)
-            log(f"    {name}: 0x{seg_start:08X}-0x{seg_end:08X}")
-            file_offset += raw_size
+        if text_start is None:
+            log("  WARNING: .text section not found, using first code section")
+            for seg_ea in idautils.Segments():
+                seg = ida_segment.getseg(seg_ea)
+                name = ida_segment.get_segm_name(seg)
+                if 'text' in name.lower() or 'code' in name.lower():
+                    text_start = seg.start_ea
+                    text_end = seg.end_ea
+                    break
 
-        # Run auto-analysis (will use x86 processor, but segments are correct)
-        log("  Running auto-analysis (x86 processor - use interactive IDA for full PPC)...")
+        if text_start:
+            log(f"  Scanning .text: 0x{text_start:08X}-0x{text_end:08X}")
+
+            # Scan for PPC function prologues:
+            # stwu r1, -X(r1) => opcode=0x25, rs=1, rt=1
+            created = 0
+            ea = text_start
+            while ea < text_end - 4:
+                if not ida_bytes.is_mapped(ea):
+                    ea = ida_bytes.next_head(ea, text_end)
+                    continue
+                word = ida_bytes.get_dword(ea)
+                # PPC stwu r1, -X(r1): opcode=0x25, rs=1, rt=1
+                if (word >> 26) == 0x25 and ((word >> 21) & 0x1F) == 1 and ((word >> 16) & 0x1F) == 1:
+                    if not ida_funcs.get_func(ea):
+                        ok = ida_funcs.add_func(ea)
+                        if ok:
+                            created += 1
+                ea += 4
+
+            log(f"  Created {created} functions from prologue scanning")
+
+        # Run auto-analysis
+        log("  Running auto-analysis...")
         idaapi.auto_wait()
+
     else:
         idapro.open_database(elf_path, run_auto_analysis=True)
 
@@ -387,17 +665,20 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
             if m: sce_matches[func_ea] = m
     log(f"Functions: {len(func_list)}, SCE matches: {len(sce_matches)}")
 
-    # Decompile
-    log("Decompiling functions...")
+    # Decompile (skip for Xbox 360 - PPC decompilation is slow/unreliable with hex-rays)
     decompiled = {}
     decompile_errors = 0
-    for i, func in enumerate(func_list):
-        try:
-            cfunc = ida_hexrays.decompile(func["address"])
-            if cfunc: decompiled[func["address"]] = str(cfunc)
-        except: decompile_errors += 1
-        if (i + 1) % 1000 == 0: log(f"  Decompiled {i+1}/{len(func_list)}...")
-    log(f"Decompiled: {len(decompiled)} OK, {decompile_errors} errors")
+    if platform == "xbox360":
+        log("Decompilation skipped for Xbox 360 (hex-rays is x86-only)")
+    else:
+        log("Decompiling functions...")
+        for i, func in enumerate(func_list):
+            try:
+                cfunc = ida_hexrays.decompile(func["address"])
+                if cfunc: decompiled[func["address"]] = str(cfunc)
+            except: decompile_errors += 1
+            if (i + 1) % 1000 == 0: log(f"  Decompiled {i+1}/{len(func_list)}...")
+        log(f"Decompiled: {len(decompiled)} OK, {decompile_errors} errors")
 
     # Strings
     log("Extracting strings...")
@@ -427,6 +708,17 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
             xrefs.append({"from": func["address"], "to": cref, "type": "jal"})
     log(f"Xrefs: {len(xrefs)}")
 
+    # Xbox 360 specific: imports + switch tables
+    if platform == "xbox360":
+        log("Extracting imports...")
+        imports = extract_imports(pe_path=load_path)
+        log(f"Imports: {len(imports)}")
+
+        log("Detecting switch tables...")
+        if text_start and text_end:
+            switch_tables = detect_switch_tables(text_start, text_end)
+        log(f"Switch tables: {len(switch_tables)}")
+
     # SQLite Database
     log(f"Building database: {db_path}")
     conn = sqlite3.connect(db_path)
@@ -435,6 +727,8 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
     conn.execute('''CREATE TABLE IF NOT EXISTS strings (address INTEGER PRIMARY KEY, text TEXT, category TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS xrefs (from_address INTEGER, to_address INTEGER, type TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS segments (name TEXT PRIMARY KEY, start_address INTEGER, end_address INTEGER, size INTEGER)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS imports (address INTEGER, module TEXT, name TEXT, ordinal INTEGER, PRIMARY KEY (address, module, name))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS switch_tables (address INTEGER PRIMARY KEY, register INTEGER, num_labels INTEGER, labels TEXT)''')
 
     for func in func_list:
         m = sce_matches.get(func["address"])
@@ -449,12 +743,16 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
     for seg_ea in idautils.Segments():
         seg = ida_segment.getseg(seg_ea)
         conn.execute("INSERT OR REPLACE INTO segments VALUES (?,?,?,?)", (ida_segment.get_segm_name(seg), seg.start_ea, seg.end_ea, seg.end_ea - seg.start_ea))
+    for imp in imports:
+        conn.execute("INSERT OR IGNORE INTO imports VALUES (?,?,?,?)", (imp["address"], imp["module"], imp["name"], imp["ordinal"]))
+    for st in switch_tables:
+        conn.execute("INSERT OR REPLACE INTO switch_tables VALUES (?,?,?,?)", (st["address"], st["register"], st["num_labels"], json.dumps(st["labels"])))
     conn.commit()
 
     # JSON Exports
     log("Exporting JSONs...")
-    segs = [{"name": ida_segment.get_segm_name(ida_segment.getseg(e)), "start": ida_segment.getseg(e).start_ea, "end": ida_segment.getseg(e).end_ea, "size": ida_segment.getseg(e).end_ea - ida_segment.getseg(e).start_ea} for e in idautils.Segments()]
-    with open(os.path.join(export_dir, "segments.json"), "w") as f: json.dump(segs, f, indent=2)
+    segs = [{"name": ida_segment.get_segm_name(ida_segment.getseg(e)), "start_address": ida_segment.getseg(e).start_ea, "end_address": ida_segment.getseg(e).end_ea, "size": ida_segment.getseg(e).end_ea - ida_segment.getseg(e).start_ea} for e in idautils.Segments()]
+    with open(os.path.join(export_dir, "segments.json"), "w") as f: json.dump({"count": len(segs), "segments": segs}, f, indent=2)
     by_cat = defaultdict(list)
     for s in strings: by_cat[s["category"]].append({"address": s["address"], "text": s["text"]})
     for cat, items in by_cat.items():
@@ -462,7 +760,11 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
     dec_list = [{"address": a, "code": c} for a, c in decompiled.items()]
     with open(os.path.join(export_dir, "decompiled_Unknown.json"), "w") as f: json.dump(dec_list, f, indent=2, ensure_ascii=False)
     unknown = [{"address": fa["address"], "name": fa["name"], "size": fa["size"]} for fa in func_list if fa["address"] not in sce_matches]
-    with open(os.path.join(export_dir, "Unknown.json"), "w") as f: json.dump(unknown, f, indent=2)
+    with open(os.path.join(export_dir, "Unknown.json"), "w") as f: json.dump({"category": None, "count": len(unknown), "functions": unknown}, f, indent=2)
+    if imports:
+        with open(os.path.join(export_dir, "imports.json"), "w") as f: json.dump({"count": len(imports), "imports": imports}, f, indent=2, ensure_ascii=False)
+    if switch_tables:
+        with open(os.path.join(export_dir, "switch_tables.json"), "w") as f: json.dump(switch_tables, f, indent=2)
 
     # Knowledge Base
     log("Generating Knowledge Base...")
@@ -471,8 +773,16 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
           "## Executive Summary", "", "| Metric | Value |", "|--------|-------|",
           f"| Total functions | {len(func_list)} |", f"| Named functions | {sum(1 for f in func_list if f['is_named'])} |",
           f"| SDK functions (SCE) | {len(sce_matches)} |", f"| Decompiled | {len(decompiled)} ({100*len(decompiled)//max(len(func_list),1)}%) |",
-          f"| Decompilation errors | {decompile_errors} |", f"| Xrefs | {len(xrefs)} |", f"| Strings | {len(strings)} |",
-          "", "## SDK Libraries", "", "| Library | Functions |", "|---------|-----------|"]
+          f"| Decompilation errors | {decompile_errors} |", f"| Xrefs | {len(xrefs)} |", f"| Strings | {len(strings)} |"]
+    if imports:
+        imp_mods = Counter(i['module'] for i in imports)
+        kb.append(f"| Imports | {len(imports)} |")
+        kb.extend(["", "## Imports", "", "| Module | Count |", "|--------|-------|"])
+        for mod, count in imp_mods.most_common(20): kb.append(f"| {mod} | {count} |")
+    if switch_tables:
+        kb.append(f"| Switch tables | {len(switch_tables)} |")
+        kb.extend(["", "## Switch Tables", "", f"Detected {len(switch_tables)} jump tables in .rdata/.data"])
+    kb.extend(["", "## SDK Libraries", "", "| Library | Functions |", "|---------|-----------|"])
     for lib, count in libs.most_common(20): kb.append(f"| {lib} | {count} |")
     kb.extend(["", "## String Categories", "", "| Category | Count |", "|----------|-------|"])
     for cat, items in sorted(by_cat.items()): kb.append(f"| {cat} | {len(items)} |")
@@ -482,6 +792,7 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
     log(f"[Phase 1] Done! DB: {db_path}, KB: {kb_path}")
     return {"functions": len(func_list), "decompiled": len(decompiled), "errors": decompile_errors,
             "strings": len(strings), "xrefs": len(xrefs), "sdk": len(sce_matches),
+            "imports": len(imports), "switch_tables": len(switch_tables),
             "func_list": func_list, "sce_matches": sce_matches, "elf_name": elf_name}
 
 # ═══════════════════════════════════════════════════════════════
@@ -561,6 +872,10 @@ if __name__ == "__main__":
                 "--output", toml_path,
                 "--all-functions",
             ]
+            # Pass switch tables if detected
+            st_json = os.path.join(output_dir, "export", "switch_tables.json")
+            if os.path.exists(st_json):
+                cmd += ["--switch-tables", st_json]
             log(f"Running: {' '.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode == 0:
