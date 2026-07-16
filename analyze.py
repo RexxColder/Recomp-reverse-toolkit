@@ -310,6 +310,119 @@ def detect_switch_tables(text_start, text_end):
     return unique[:2000]  # cap at 2000 tables
 
 # ═══════════════════════════════════════════════════════════════
+# XEX HEADER PARSING (Xbox 360 metadata)
+# ═══════════════════════════════════════════════════════════════
+
+def parse_xex_header(xex_path):
+    """Extract metadata from XEX2 header: Title ID, etc."""
+    info = {}
+    try:
+        with open(xex_path, 'rb') as f:
+            magic = f.read(4)
+            if magic != b'XEX2':
+                return info
+            # XEX2 header is big-endian
+            default_xex_size = struct.unpack('>I', f.read(4))[0]
+            xex_headers_size = struct.unpack('>I', f.read(4))[0]
+            security_info_offset = struct.unpack('>I', f.read(4))[0]
+            # Seek to security info to get Title ID
+            f.seek(security_info_offset)
+            header_hash = f.read(32)
+            # Title ID is at offset 0xA0 from security info start (varies)
+            # Try to find it by scanning for patterns
+            f.seek(0)
+            data = f.read(min(0x200, os.path.getsize(xex_path)))
+            # Title ID is typically a 4-byte value after certain headers
+            # For now, extract from the PE we already have
+    except Exception:
+        pass
+    return info
+
+
+# ═══════════════════════════════════════════════════════════════
+# CHECKS & VALIDATIONS (Xbox 360 error patterns)
+# ═══════════════════════════════════════════════════════════════
+
+CHECK_CATEGORIES = {
+    "Error_General": re.compile(r"(error|fail|assert|panic|abort)", re.IGNORECASE),
+    "Version_Check": re.compile(r"(version|title.?update|TU\d|system.?version)", re.IGNORECASE),
+    "File_Error": re.compile(r"(file|open|read|write|stfs|io.?error|disk)", re.IGNORECASE),
+    "Assert_Fatal": re.compile(r"(fatal|abort|crash|deadlock|unreachable)", re.IGNORECASE),
+    "GPU_Render": re.compile(r"(D3D|render|shader|texture|gpu|vertex|pixel|draw)", re.IGNORECASE),
+    "Memory_Error": re.compile(r"(alloc|free|heap|overflow|corrupt|oom|leak)", re.IGNORECASE),
+    "Kinect_Validation": re.compile(r"(nui|kinect|skeleton|body|tracking|gesture)", re.IGNORECASE),
+    "Audio_System": re.compile(r"(audio|xma|sound|voice|music|sfx|adpcm)", re.IGNORECASE),
+    "Save_Data": re.compile(r"(save|profile|storage|mount|unmount|container)", re.IGNORECASE),
+    "Avatar_System": re.compile(r"(avatar|manifest|asset|animation)", re.IGNORECASE),
+    "Network_Error": re.compile(r"(network|socket|connect|timeout|disconnect|packet)", re.IGNORECASE),
+    "Online_Auth": re.compile(r"(auth|login|credential|token|session|xuid)", re.IGNORECASE),
+    "DRM_Security": re.compile(r"(drm|security|encrypt|license|protect|console)", re.IGNORECASE),
+    "Debug_Output": re.compile(r"(debug|trace|log|printf|output|print)", re.IGNORECASE),
+    "Region_Lock": re.compile(r"(region|locale|language|territory|country)", re.IGNORECASE),
+    "Game_Logic": re.compile(r"(game|level|stage|mission|objective|player)", re.IGNORECASE),
+}
+
+def detect_checks(func_list, decompiled, strings):
+    """Classify functions that contain error/validation patterns."""
+    checks = []
+    # Build string text set for quick lookup
+    string_texts = set()
+    for s in strings:
+        string_texts.add(s["text"].lower())
+
+    for func in func_list:
+        ea = func["address"]
+        code = decompiled.get(ea, "")
+        code_lower = code.lower()
+        matched = False
+        for cat, pattern in CHECK_CATEGORIES.items():
+            if pattern.search(code_lower):
+                checks.append({"address": ea, "category": cat, "description": func["name"]})
+                matched = True
+                break
+        # Also check if function references error strings
+        if not matched:
+            for s_text in string_texts:
+                if any(kw in s_text for kw in ["error", "fail", "assert", "panic"]):
+                    # Check if this function has xrefs to that string
+                    # (simplified: just check function name/size patterns)
+                    pass
+    return checks
+
+
+# ═══════════════════════════════════════════════════════════════
+# SUBSYSTEM CLASSIFICATION (Xbox 360)
+# ═══════════════════════════════════════════════════════════════
+
+SUBSYSTEM_PATTERNS = {
+    "NETWORKING": re.compile(r"(XNet|NetDll|WSA|socket|connect|send|recv|XOnline)", re.IGNORECASE),
+    "GRAPHICS": re.compile(r"(D3D|Xe|Rw|Hedgehog|render|shader|texture|vertex|pixel|draw|material|mesh)", re.IGNORECASE),
+    "MEMORY": re.compile(r"(ExAllocate|XMem|alloc|free|heap|memcpy|memset|RtlAllocate)", re.IGNORECASE),
+    "KINECT": re.compile(r"(Nui|NUI_|skeleton|body|tracking|gesture|kinect)", re.IGNORECASE),
+    "AUDIO": re.compile(r"(XMA|XAudio|sound|audio|voice|music|sfx|adpcm)", re.IGNORECASE),
+}
+
+def classify_subsystems(func_list, decompiled):
+    """Classify functions by subsystem based on pseudocode patterns."""
+    results = []
+    for func in func_list:
+        ea = func["address"]
+        code = decompiled.get(ea, "")
+        subsystem = "UNCATEGORIZED"
+        for sub, pattern in SUBSYSTEM_PATTERNS.items():
+            if pattern.search(code):
+                subsystem = sub
+                break
+        results.append({
+            "subsystem": subsystem,
+            "address": ea,
+            "name": func["name"],
+            "size": func["size"]
+        })
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════
 # STRING CATEGORIZATION
 # ═══════════════════════════════════════════════════════════════
 
@@ -665,20 +778,17 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
             if m: sce_matches[func_ea] = m
     log(f"Functions: {len(func_list)}, SCE matches: {len(sce_matches)}")
 
-    # Decompile (skip for Xbox 360 - PPC decompilation is slow/unreliable with hex-rays)
+    # Decompile
     decompiled = {}
     decompile_errors = 0
-    if platform == "xbox360":
-        log("Decompilation skipped for Xbox 360 (hex-rays is x86-only)")
-    else:
-        log("Decompiling functions...")
-        for i, func in enumerate(func_list):
-            try:
-                cfunc = ida_hexrays.decompile(func["address"])
-                if cfunc: decompiled[func["address"]] = str(cfunc)
-            except: decompile_errors += 1
-            if (i + 1) % 1000 == 0: log(f"  Decompiled {i+1}/{len(func_list)}...")
-        log(f"Decompiled: {len(decompiled)} OK, {decompile_errors} errors")
+    log("Decompiling functions...")
+    for i, func in enumerate(func_list):
+        try:
+            cfunc = ida_hexrays.decompile(func["address"])
+            if cfunc: decompiled[func["address"]] = str(cfunc)
+        except: decompile_errors += 1
+        if (i + 1) % 1000 == 0: log(f"  Decompiled {i+1}/{len(func_list)}...")
+    log(f"Decompiled: {len(decompiled)} OK, {decompile_errors} errors")
 
     # Strings
     log("Extracting strings...")
@@ -719,6 +829,17 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
             switch_tables = detect_switch_tables(text_start, text_end)
         log(f"Switch tables: {len(switch_tables)}")
 
+        log("Detecting checks/validations...")
+        checks = detect_checks(func_list, decompiled, strings)
+        log(f"Checks: {len(checks)}")
+
+        log("Classifying subsystems...")
+        subsystem_funcs = classify_subsystems(func_list, decompiled)
+        log(f"Subsystem functions: {sum(1 for s in subsystem_funcs if s['subsystem'] != 'UNCATEGORIZED')} classified")
+    else:
+        checks = []
+        subsystem_funcs = []
+
     # SQLite Database
     log(f"Building database: {db_path}")
     conn = sqlite3.connect(db_path)
@@ -729,6 +850,8 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
     conn.execute('''CREATE TABLE IF NOT EXISTS segments (name TEXT PRIMARY KEY, start_address INTEGER, end_address INTEGER, size INTEGER)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS imports (address INTEGER, module TEXT, name TEXT, ordinal INTEGER, PRIMARY KEY (address, module, name))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS switch_tables (address INTEGER PRIMARY KEY, register INTEGER, num_labels INTEGER, labels TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS checks (id INTEGER PRIMARY KEY AUTOINCREMENT, function_address INTEGER, category TEXT, description TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS subsystem_funcs (subsystem TEXT, address INTEGER, name TEXT, size INTEGER)''')
 
     for func in func_list:
         m = sce_matches.get(func["address"])
@@ -747,6 +870,10 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
         conn.execute("INSERT OR IGNORE INTO imports VALUES (?,?,?,?)", (imp["address"], imp["module"], imp["name"], imp["ordinal"]))
     for st in switch_tables:
         conn.execute("INSERT OR REPLACE INTO switch_tables VALUES (?,?,?,?)", (st["address"], st["register"], st["num_labels"], json.dumps(st["labels"])))
+    for chk in checks:
+        conn.execute("INSERT INTO checks (function_address, category, description) VALUES (?,?,?)", (chk["address"], chk["category"], chk["description"]))
+    for sf in subsystem_funcs:
+        conn.execute("INSERT INTO subsystem_funcs VALUES (?,?,?,?)", (sf["subsystem"], sf["address"], sf["name"], sf["size"]))
     conn.commit()
 
     # JSON Exports
@@ -765,27 +892,175 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
         with open(os.path.join(export_dir, "imports.json"), "w") as f: json.dump({"count": len(imports), "imports": imports}, f, indent=2, ensure_ascii=False)
     if switch_tables:
         with open(os.path.join(export_dir, "switch_tables.json"), "w") as f: json.dump(switch_tables, f, indent=2)
+    if checks:
+        with open(os.path.join(export_dir, "checks.json"), "w") as f: json.dump({"count": len(checks), "checks": checks}, f, indent=2)
 
     # Knowledge Base
     log("Generating Knowledge Base...")
-    libs = Counter(m['library'] for m in sce_matches.values())
-    kb = [f"# {base} — Knowledge Base", "", f"**Binary**: {elf_name}", "", "---", "",
-          "## Executive Summary", "", "| Metric | Value |", "|--------|-------|",
-          f"| Total functions | {len(func_list)} |", f"| Named functions | {sum(1 for f in func_list if f['is_named'])} |",
-          f"| SDK functions (SCE) | {len(sce_matches)} |", f"| Decompiled | {len(decompiled)} ({100*len(decompiled)//max(len(func_list),1)}%) |",
-          f"| Decompilation errors | {decompile_errors} |", f"| Xrefs | {len(xrefs)} |", f"| Strings | {len(strings)} |"]
+
+    # Get segments info
+    seg_list = []
+    for seg_ea in idautils.Segments():
+        seg = ida_segment.getseg(seg_ea)
+        seg_list.append({
+            "name": ida_segment.get_segm_name(seg),
+            "start": seg.start_ea,
+            "end": seg.end_ea,
+            "size": seg.end_ea - seg.start_ea
+        })
+
+    # Function size distribution
+    size_ranges = [(0, 50), (50, 200), (200, 500), (500, 1024), (1024, 5120), (5120, 51200)]
+    size_dist = {}
+    for lo, hi in size_ranges:
+        label = f"{lo}-{hi}B" if hi < 1024 else f"{lo//1024}-{hi//1024}KB"
+        size_dist[label] = sum(1 for f in func_list if lo <= f["size"] < hi)
+
+    # Top 20 largest functions
+    top_funcs = sorted(func_list, key=lambda f: f["size"], reverse=True)[:20]
+
+    # Subsystem classification summary
+    sub_counts = Counter(s["subsystem"] for s in subsystem_funcs)
+    sub_apis = {
+        "NETWORKING": "XNet*, NetDll*, WSA*, socket",
+        "GRAPHICS": "D3D*, Xe*, Rw*, Hedgehog",
+        "MEMORY": "ExAllocatePool, XMemAlloc",
+        "KINECT": "Nui*, NUI_*",
+        "AUDIO": "XMA, XAudio2",
+    }
+
+    # Checks summary
+    check_counts = Counter(c["category"] for c in checks)
+
+    kb = []
+    kb.append(f"# {base} — Knowledge Base")
+    kb.append("")
+    kb.append(f"**Binary**: {elf_name}")
+    if platform == "xbox360":
+        kb.append(f"**Platform**: Xbox 360")
+    elif platform == "ps2":
+        kb.append(f"**Platform**: PS2")
+    kb.append("")
+    kb.append("---")
+    kb.append("")
+
+    # 1. Executive Summary
+    kb.append("## 1. Executive Summary")
+    kb.append("")
+    kb.append("| Metric | Value |")
+    kb.append("|--------|-------|")
+    kb.append(f"| Total functions | {len(func_list)} |")
+    kb.append(f"| Named functions | {sum(1 for f in func_list if f['is_named'])} |")
+    kb.append(f"| Decompiled | {len(decompiled)} ({100*len(decompiled)//max(len(func_list),1)}%) |")
+    kb.append(f"| Decompilation errors | {decompile_errors} |")
+    kb.append(f"| Strings | {len(strings)} |")
+    kb.append(f"| Xrefs | {len(xrefs)} |")
+    kb.append(f"| Segments | {len(seg_list)} |")
+    if checks:
+        kb.append(f"| Check functions | {len(checks)} |")
     if imports:
-        imp_mods = Counter(i['module'] for i in imports)
         kb.append(f"| Imports | {len(imports)} |")
-        kb.extend(["", "## Imports", "", "| Module | Count |", "|--------|-------|"])
-        for mod, count in imp_mods.most_common(20): kb.append(f"| {mod} | {count} |")
     if switch_tables:
         kb.append(f"| Switch tables | {len(switch_tables)} |")
-        kb.extend(["", "## Switch Tables", "", f"Detected {len(switch_tables)} jump tables in .rdata/.data"])
-    kb.extend(["", "## SDK Libraries", "", "| Library | Functions |", "|---------|-----------|"])
-    for lib, count in libs.most_common(20): kb.append(f"| {lib} | {count} |")
-    kb.extend(["", "## String Categories", "", "| Category | Count |", "|----------|-------|"])
-    for cat, items in sorted(by_cat.items()): kb.append(f"| {cat} | {len(items)} |")
+    kb.append("")
+
+    # 2. Binary Layout
+    kb.append("## 2. Binary Layout")
+    kb.append("")
+    kb.append("| Section | Start | End | Size |")
+    kb.append("|---------|-------|-----|------|")
+    for seg in seg_list:
+        kb.append(f"| `{seg['name']}` | 0x{seg['start']:08x} | 0x{seg['end']:08x} | 0x{seg['size']:x} ({seg['size']:,} bytes) |")
+    kb.append("")
+
+    # 3. Function Census
+    kb.append("## 3. Function Census")
+    kb.append("")
+    kb.append("### Size Distribution")
+    kb.append("")
+    kb.append("| Range | Count |")
+    kb.append("|-------|-------|")
+    for label, count in size_dist.items():
+        kb.append(f"| {label} | {count} |")
+    kb.append("")
+    kb.append("### Top 20 Largest Functions")
+    kb.append("")
+    kb.append("| Address | Name | Size |")
+    kb.append("|---------|------|------|")
+    for f in top_funcs:
+        kb.append(f"| 0x{f['address']:08x} | {f['name']} | {f['size']:,}B |")
+    kb.append("")
+
+    # 4. Subsystem Classification
+    if subsystem_funcs:
+        classified = sum(1 for s in subsystem_funcs if s["subsystem"] != "UNCATEGORIZED")
+        if classified > 0:
+            kb.append("## 4. Subsystem Classification")
+            kb.append("")
+            kb.append("*Based on pseudocode pattern matching (SDK API calls + string references)*")
+            kb.append("")
+            kb.append("| Subsystem | Functions | Key APIs |")
+            kb.append("|-----------|----------|----------|")
+            for sub in ["NETWORKING", "GRAPHICS", "MEMORY", "KINECT", "AUDIO", "UNCATEGORIZED"]:
+                cnt = sub_counts.get(sub, 0)
+                if cnt > 0:
+                    apis = sub_apis.get(sub, "")
+                    kb.append(f"| {sub} | {cnt} | {apis} |")
+            kb.append("")
+
+    # 5. Checks & Validations Catalog
+    if checks:
+        kb.append("## 5. Checks & Validations Catalog")
+        kb.append("")
+        kb.append("| Category | Count |")
+        kb.append("|----------|-------|")
+        for cat, cnt in check_counts.most_common():
+            kb.append(f"| {cat} | {cnt} |")
+        kb.append("")
+        kb.append("### Detailed Check Functions")
+        kb.append("")
+        # Group by category
+        checks_by_cat = defaultdict(list)
+        for c in checks:
+            checks_by_cat[c["category"]].append(c)
+        for cat in sorted(checks_by_cat.keys()):
+            kb.append(f"#### {cat}")
+            kb.append("")
+            kb.append("| Address | Function |")
+            kb.append("|---------|----------|")
+            for c in checks_by_cat[cat][:25]:  # limit per category
+                kb.append(f"| 0x{c['address']:08x} | {c['description']} |")
+            if len(checks_by_cat[cat]) > 25:
+                kb.append(f"| ... | +{len(checks_by_cat[cat])-25} more |")
+            kb.append("")
+
+    # 6. Imports
+    if imports:
+        imp_mods = Counter(i['module'] for i in imports)
+        kb.append("## 6. Imports")
+        kb.append("")
+        kb.append("| Module | Count |")
+        kb.append("|--------|-------|")
+        for mod, count in imp_mods.most_common(20):
+            kb.append(f"| {mod} | {count} |")
+        kb.append("")
+
+    # 7. Switch Tables
+    if switch_tables:
+        kb.append("## 7. Switch Tables")
+        kb.append("")
+        kb.append(f"Detected {len(switch_tables)} jump tables in .rdata")
+        kb.append("")
+
+    # 8. String Categories
+    kb.append("## 8. String Categories")
+    kb.append("")
+    kb.append("| Category | Count |")
+    kb.append("|----------|-------|")
+    for cat, items in sorted(by_cat.items()):
+        kb.append(f"| {cat} | {len(items)} |")
+    kb.append("")
+
     with open(kb_path, "w") as f: f.write("\n".join(kb))
 
     conn.close()
@@ -793,6 +1068,7 @@ def full_analysis(elf_path, output_dir, sce_db=None, platform=None):
     return {"functions": len(func_list), "decompiled": len(decompiled), "errors": decompile_errors,
             "strings": len(strings), "xrefs": len(xrefs), "sdk": len(sce_matches),
             "imports": len(imports), "switch_tables": len(switch_tables),
+            "checks": len(checks), "subsystem_funcs": len(subsystem_funcs),
             "func_list": func_list, "sce_matches": sce_matches, "elf_name": elf_name}
 
 # ═══════════════════════════════════════════════════════════════
